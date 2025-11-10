@@ -1,8 +1,9 @@
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
+from bson import ObjectId
 
 from database import db, create_document, get_documents
 
@@ -58,7 +59,7 @@ def test_database():
     return response
 
 
-# Utility to convert Mongo docs
+# Utilities
 
 def _doc_with_id(doc: dict):
     if not doc:
@@ -69,32 +70,71 @@ def _doc_with_id(doc: dict):
     return d
 
 
-# Read endpoints for core entities
-@app.get("/students")
-async def list_students(limit: int = 50):
-    try:
-        items = get_documents("student", {}, limit)
-        return [_doc_with_id(x) for x in items]
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+def _oid(id_str: str) -> ObjectId:
+    if not ObjectId.is_valid(id_str):
+        raise HTTPException(status_code=400, detail="Invalid id")
+    return ObjectId(id_str)
 
 
-@app.get("/teachers")
-async def list_teachers(limit: int = 50):
-    try:
-        items = get_documents("teacher", {}, limit)
-        return [_doc_with_id(x) for x in items]
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+def _tenant_filter(tenant_id: Optional[str]):
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="Missing tenant_id. Provide 'x-tenant-id' header or tenant_id query param.")
+    return {"tenant_id": tenant_id}
 
 
-@app.get("/classes")
-async def list_classes(limit: int = 50):
-    try:
-        items = get_documents("class", {}, limit)
-        return [_doc_with_id(x) for x in items]
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+# Schemas for payloads
+class CreateStudent(BaseModel):
+    first_name: str
+    last_name: str
+    email: Optional[str] = None
+    grade: Optional[str] = None
+    dob: Optional[str] = None
+    parent_ids: Optional[List[str]] = []
+    class_ids: Optional[List[str]] = []
+    status: Optional[str] = "active"
+
+
+class UpdateStudent(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    grade: Optional[str] = None
+    dob: Optional[str] = None
+    parent_ids: Optional[List[str]] = None
+    class_ids: Optional[List[str]] = None
+    status: Optional[str] = None
+
+
+class CreateTeacher(BaseModel):
+    first_name: str
+    last_name: str
+    email: str
+    subject: Optional[str] = None
+    is_admin: bool = False
+
+
+class UpdateTeacher(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    subject: Optional[str] = None
+    is_admin: Optional[bool] = None
+
+
+class CreateClass(BaseModel):
+    name: str
+    code: str
+    teacher_id: Optional[str] = None
+    grade_level: Optional[str] = None
+    student_ids: Optional[List[str]] = []
+
+
+class UpdateClass(BaseModel):
+    name: Optional[str] = None
+    code: Optional[str] = None
+    teacher_id: Optional[str] = None
+    grade_level: Optional[str] = None
+    student_ids: Optional[List[str]] = None
 
 
 class CreateAnnouncement(BaseModel):
@@ -103,20 +143,188 @@ class CreateAnnouncement(BaseModel):
     audience: str = "all"
 
 
-@app.post("/announcements")
-async def create_announcement(payload: CreateAnnouncement):
+class FeeInvoice(BaseModel):
+    student_id: str
+    amount: float
+    currency: str = "USD"
+    due_date: Optional[str] = None
+    status: str = "open"
+    memo: Optional[str] = None
+
+
+class Payment(BaseModel):
+    invoice_id: str
+    amount: float
+    method: str = "stripe"
+    reference: Optional[str] = None
+
+
+# Students
+@app.get("/students")
+async def list_students(limit: int = 50, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
     try:
-        ann_id = create_document("announcement", payload.model_dump())
+        filt = _tenant_filter(t)
+        items = get_documents("student", filt, limit)
+        return [_doc_with_id(x) for x in items]
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+
+
+@app.post("/students")
+async def create_student(payload: CreateStudent, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
+    data = payload.model_dump()
+    data["tenant_id"] = t
+    try:
+        _tenant_filter(t)
+        new_id = create_document("student", data)
+        return {"id": new_id, "message": "Student created"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+
+
+@app.put("/students/{student_id}")
+async def update_student(student_id: str, payload: UpdateStudent, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
+    _tenant_filter(t)
+    try:
+        updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+        res = db["student"].update_one({"_id": _oid(student_id), "tenant_id": t}, {"$set": updates})
+        if res.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Student not found")
+        return {"id": student_id, "updated": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+
+
+@app.delete("/students/{student_id}")
+async def delete_student(student_id: str, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
+    _tenant_filter(t)
+    try:
+        res = db["student"].delete_one({"_id": _oid(student_id), "tenant_id": t})
+        if res.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Student not found")
+        return {"id": student_id, "deleted": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+
+
+# Teachers
+@app.get("/teachers")
+async def list_teachers(limit: int = 50, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
+    try:
+        items = get_documents("teacher", _tenant_filter(t), limit)
+        return [_doc_with_id(x) for x in items]
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+
+
+@app.post("/teachers")
+async def create_teacher(payload: CreateTeacher, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
+    data = payload.model_dump()
+    data["tenant_id"] = t
+    try:
+        _tenant_filter(t)
+        new_id = create_document("teacher", data)
+        return {"id": new_id, "message": "Teacher created"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+
+
+# Classes
+@app.get("/classes")
+async def list_classes(limit: int = 50, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
+    try:
+        items = get_documents("class", _tenant_filter(t), limit)
+        return [_doc_with_id(x) for x in items]
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+
+
+@app.post("/classes")
+async def create_class(payload: CreateClass, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
+    data = payload.model_dump()
+    data["tenant_id"] = t
+    try:
+        _tenant_filter(t)
+        new_id = create_document("class", data)
+        return {"id": new_id, "message": "Class created"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+
+
+# Announcements
+@app.post("/announcements")
+async def create_announcement(payload: CreateAnnouncement, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
+    try:
+        _tenant_filter(t)
+        data = payload.model_dump()
+        data["tenant_id"] = t
+        ann_id = create_document("announcement", data)
         return {"id": ann_id, "message": "Announcement created"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
 
 
 @app.get("/announcements")
-async def list_announcements(limit: int = 20):
+async def list_announcements(limit: int = 20, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
     try:
-        items = get_documents("announcement", {}, limit)
+        items = get_documents("announcement", _tenant_filter(t), limit)
         return [_doc_with_id(x) for x in items]
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+
+
+# Finance
+@app.post("/invoices")
+async def create_invoice(payload: FeeInvoice, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
+    try:
+        _tenant_filter(t)
+        data = payload.model_dump()
+        data["tenant_id"] = t
+        inv_id = create_document("feeinvoice", data)
+        return {"id": inv_id, "message": "Invoice created"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+
+
+@app.get("/invoices")
+async def list_invoices(limit: int = 50, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
+    try:
+        items = get_documents("feeinvoice", _tenant_filter(t), limit)
+        return [_doc_with_id(x) for x in items]
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
+
+
+@app.post("/payments")
+async def create_payment(payload: Payment, tenant_id: Optional[str] = Query(default=None), x_tenant_id: Optional[str] = Header(default=None)):
+    t = x_tenant_id or tenant_id
+    try:
+        _tenant_filter(t)
+        data = payload.model_dump()
+        data["tenant_id"] = t
+        pay_id = create_document("payment", data)
+        # also mark invoice paid if amounts match (best-effort)
+        try:
+            db["feeinvoice"].update_one({"_id": _oid(data["invoice_id"])}, {"$set": {"status": "paid"}})
+        except Exception:
+            pass
+        return {"id": pay_id, "message": "Payment recorded"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database unavailable: {str(e)}")
 
